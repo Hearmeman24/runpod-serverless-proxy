@@ -1,7 +1,11 @@
 # Importing necessary libraries
+import logging
+import os
+import traceback
+
 from fastapi import FastAPI, APIRouter, Request, HTTPException
 from runpod_serverless import ApiConfig, RunpodServerlessCompletion, Params, RunpodServerlessEmbedding
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 import json, time
 from uvicorn import Config, Server
 from pathlib import Path
@@ -13,6 +17,35 @@ model_data = {
 }
 
 configs = []
+logger = logging.getLogger("proxy")
+
+def _exc_to_payload(e: Exception):
+    """Turn an exception (incl. requests/httpx HTTP errors) into a JSON body + status."""
+    status = 500
+    body = {
+        "error": "proxy_error",
+        "type": e.__class__.__name__,
+        "message": str(e),
+    }
+
+    # If this came from requests/httpx, try to include upstream status/body
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            upstream_body = resp.json()
+        except Exception:
+            upstream_body = getattr(resp, "text", "")[:4000]  # avoid huge logs
+        status = getattr(resp, "status_code", status) or status
+        body.update({
+            "upstream_status": status,
+            "upstream_body": upstream_body,
+        })
+
+    # Optional debug traceback (enable with DEBUG_ERRORS=1)
+    if os.getenv("DEBUG_ERRORS", "0") == "1":
+        body["traceback"] = traceback.format_exc(limit=25).splitlines()
+
+    return status, body
 
 def run(config_path: str, host: str = "127.0.0.1", port: int = 3000):
     if config_path:
@@ -118,28 +151,53 @@ params = Params()
 async def request_chat(request: Request):
     try:
         data = await request.json()
-        print(data)
         model = data.get("model")
         if not model:
             return JSONResponse(status_code=400, content={"detail": "Missing model in request."})
-        
+
         api = get_config_by_model(model)
         payload = data.get("messages")
+
         params_dict = params.dict()
         params_dict.update(data)
         new_params = Params(**params_dict)
         runpod: RunpodServerlessCompletion = RunpodServerlessCompletion(api=api, params=new_params)
-        
-        if(data["stream"]==False):
+
+        # Non-streaming
+        if not data.get("stream"):
             response = get_chat_synchronous(runpod, payload, model)
+            # If your helper returns a requests.Response, pass it through verbatim:
+            if hasattr(response, "status_code") and hasattr(response, "content"):
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    media_type=response.headers.get("content-type", "application/json"),
+                )
+            # Otherwise assume it's already a FastAPI response:
             return response
-        else:
-            stream_data = get_chat_asynchronous(runpod, payload)
-            response = StreamingResponse(content=stream_data, media_type="text/event-stream")
-            response.body_iterator = stream_data.__aiter__()
-            return response
+
+        # Streaming
+        stream_data = get_chat_asynchronous(runpod, payload)
+
+        # Wrap the generator so stream errors become a single JSON frame instead of killing the connection
+        async def safe_stream(gen):
+            try:
+                async for chunk in gen:
+                    yield chunk
+            except Exception as e:
+                status, body = _exc_to_payload(e)
+                # Send one JSON error event and end the stream
+                yield f"data: {json.dumps({'stream_error': body, 'status': status})}\n\n".encode()
+
+        response = StreamingResponse(content=safe_stream(stream_data), media_type="text/event-stream")
+        # Keep your explicit iterator if you need it:
+        response.body_iterator = safe_stream(stream_data).__aiter__()
+        return response
+
     except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": str(e)})
+        logger.exception("request_chat failed")
+        status, body = _exc_to_payload(e)
+        return JSONResponse(status_code=status, content=body)
 
 # API endpoint for completions
 @router.post('/completions')
