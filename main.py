@@ -166,7 +166,7 @@ async def request_chat(request: Request):
         api = get_config_by_model(model)
         payload = data.get("messages")
 
-        params_dict = params.dict()
+        params_dict = params.model_dump()
         params_dict.update(data)
 
         # Handle extra_body parameter
@@ -228,7 +228,7 @@ async def request_prompt(request: Request):
         payload = data.get("prompt")[0]
         api = get_config_by_model(model)
 
-        params_dict = params.dict()
+        params_dict = params.model_dump()
         params_dict.update(data)
 
         # Handle extra_body parameter

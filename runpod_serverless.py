@@ -71,22 +71,36 @@ class RunpodServerlessCompletion:
     def _prepare_input(self, payload: Any, stream: bool = False, batch_size: int = None) -> Dict[str, Any]:
         if batch_size is None:
             batch_size = self.batch_size
+
+        # Start with base sampling params
+        sampling_params = self.params.model_dump()  # Use model_dump instead of deprecated dict()
+
+        # Add extra_body parameters to sampling_params for vLLM worker
+        if hasattr(self, 'extra_body') and self.extra_body:
+            # For runpod/worker-vllm, chat_template_kwargs should be in sampling_params
+            if 'chat_template_kwargs' in self.extra_body:
+                sampling_params["chat_template_kwargs"] = self.extra_body["chat_template_kwargs"]
+                print(f"Added chat_template_kwargs to sampling_params: {self.extra_body['chat_template_kwargs']}")
+
+            # Add any other extra_body params to sampling_params as well
+            for key, value in self.extra_body.items():
+                if key != 'chat_template_kwargs':  # Already handled above
+                    sampling_params[key] = value
+
+            print(f"Final sampling_params: {sampling_params}")
+
         input = {
-            "sampling_params": self.params.dict(),
+            "sampling_params": sampling_params,
             "stream": stream,
             "use_openai_format": self.use_openai_format,
             "batch_size": batch_size
         }
 
-        # Add extra_body parameters to input
-        if hasattr(self, 'extra_body') and self.extra_body:
-            input.update(self.extra_body)
-            print(f"Added extra_body to input: {self.extra_body}")
-
         if isinstance(payload, str):
             input["prompt"] = payload
         else:
             input["messages"] = payload
+
         return input
 
     # This function generates a request and waits for its completion or cancellation.
